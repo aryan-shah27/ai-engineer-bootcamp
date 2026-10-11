@@ -5,7 +5,7 @@ The code is my own. The course notebooks and datasets are not included.
 
 | Project | What it shows | Status |
 |---|---|---|
-| [NLP pipeline](#nlp-pipeline-ag-news) | Every technique from the course's NLP module, in one script, on 120k real news articles | 🚧 stage 2 of 7 |
+| [NLP pipeline](#nlp-pipeline-ag-news) | Every technique from the course's NLP module, in one script, on 120k real news articles | 🚧 stage 3 of 7 |
 
 ---
 
@@ -19,7 +19,7 @@ The analysis stages use a stratified sample of 4,000 articles (1,000 per categor
 |---|---|---|
 | 1. Preprocessing | regex cleanup, lowercasing, tokenization, stop words, stemming vs lemmatization, n-grams | ✅ |
 | 2. POS & NER | part-of-speech tagging, named entity recognition (spaCy) | ✅ |
-| 3. Sentiment | rule-based (VADER) vs pre-trained transformer | ⏳ |
+| 3. Sentiment | rule-based (VADER) vs pre-trained transformer (DistilBERT) | ✅ |
 | 4. Vectorizing | bag of words vs TF-IDF, cosine similarity | ⏳ |
 | 5. Topic modelling | LDA, LSA, choosing the number of topics | ⏳ |
 | 6. Text classifier | logistic regression vs naive Bayes vs linear SVM | ⏳ |
@@ -35,8 +35,8 @@ python nlp/nlp_pipeline.py                     # all stages
 python nlp/nlp_pipeline.py --stage preprocess  # one stage
 ```
 
-`requirements.txt` also installs spaCy's small English model (`en_core_web_sm`). The first run downloads AG News from
-Hugging Face and the NLTK word lists; both are cached afterwards.
+`requirements.txt` also installs spaCy's small English model (`en_core_web_sm`). The first run downloads AG News, the
+DistilBERT sentiment model (~270 MB) and the NLTK word lists; all are cached afterwards. A full run takes about 1.5 minutes on a laptop CPU.
 Charts and tables are saved to [`nlp/results/`](nlp/results/).
 
 ### Stage 1: Preprocessing
@@ -78,6 +78,25 @@ and context to tell "Apple" the company from "apple" the fruit.
   what surrounds it, and tech and brand names look like people's names.
 - **Finding a name isn't the same as knowing who it is:** "US" (121), "U.S." (59) and "the United States" are counted as
   different entities. Merging them is a separate step called entity linking.
+
+### Stage 3: Sentiment analysis
+
+Two approaches score the same 1,000 articles (250 per category):
+- **VADER (rule-based):** adds up word scores from a hand-built lexicon, uses capitals and "!" as intensity, and can say neutral.
+- **DistilBERT (pre-trained transformer):** fine-tuned on movie-review sentences (SST-2). It only knows positive and negative.
+
+![Sentiment by category](nlp/results/sentiment_by_category.png)
+
+- **Does sentiment differ by news type? Yes.** Both models rank World news the most negative (VADER mean −0.20; 58%
+  negative by VADER, 74% by DistilBERT), while Sports and Sci/Tech are the most upbeat (VADER +0.16 each).
+  [Tables](nlp/results/sentiment.md)
+- **The transformer is out of its domain.** It calls 65% of all articles negative, including 75% of Business news
+  (VADER: 37%). It learned sentiment from movie reviews and has no "neutral" option, so factual reporting gets forced into a side.
+- **The two models agree on only 62% of articles** where VADER picks a side.
+- **Each fails differently.** VADER reads words, not meaning: "Supporting Musharraf was greatest blunder" scores +0.92
+  ("supporting", "greatest"), and "Syracuse Dismantles Memphis", a win, scores −0.85 ("dismantles"). DistilBERT handles
+  those but calls "Jakarta Hunts Islamic Militants After Embassy Attack" positive with 100% confidence.
+  A confident score isn't a correct one.
 
 ---
 

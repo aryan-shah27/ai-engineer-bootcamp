@@ -29,15 +29,18 @@ import matplotlib
 
 matplotlib.use("Agg")  # save charts as PNG files instead of opening windows
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import nltk
 import pandas as pd
 import spacy
 from nltk.corpus import stopwords
+from nltk.sentiment import SentimentIntensityAnalyzer
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 from nltk.tokenize import word_tokenize
 from nltk.util import ngrams
 
 N = 4000  # articles sampled for the analysis stages (1,000 per category)
+SENTIMENT_N = 1000  # the transformer manages ~20 articles/second on a CPU, so sentiment uses a smaller sample
 SEED = 42
 CATEGORIES = ["World", "Sports", "Business", "Sci/Tech"]
 RESULTS = Path(__file__).parent / "results"
@@ -73,7 +76,8 @@ def ensure_nltk_data():
     """Download the NLTK resources this script needs, once."""
     for path, package in [("tokenizers/punkt_tab", "punkt_tab"),
                           ("corpora/stopwords", "stopwords"),
-                          ("corpora/wordnet", "wordnet")]:
+                          ("corpora/wordnet", "wordnet"),
+                          ("sentiment/vader_lexicon.zip", "vader_lexicon")]:
         try:
             nltk.data.find(path)
         except LookupError:
@@ -308,11 +312,92 @@ def stage_pos_ner(df):
                "top_entities.md", "Same name, different labels (where NER gets confused)", append=True)
 
 
+# --------------------------------------------------------------------------- stage 3: sentiment analysis
+
+SENTIMENT_MODEL = "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+
+
+def vader_label(compound):
+    """VADER's usual cut-offs: compound >= 0.05 is positive, <= -0.05 negative, anything between is neutral."""
+    return "positive" if compound >= 0.05 else "negative" if compound <= -0.05 else "neutral"
+
+
+def stage_sentiment(df):
+    """Course: Sentiment Analysis - rule-based (VADER) vs a pre-trained transformer.
+
+    Both run on text_fixed: VADER scores capitals and "!" as intensity, and the transformer
+    was trained on normal sentences, so neither should see the stage 1 tokens.
+    """
+    from transformers import pipeline, logging as hf_logging  # imported here: loading torch is slow
+    hf_logging.set_verbosity_error()
+    hf_logging.disable_progress_bar()
+    df = (df.groupby("category", group_keys=False)  # both models score the same 1,000 articles
+            .sample(n=SENTIMENT_N // len(CATEGORIES), random_state=SEED).copy())
+
+    # 1. Rule-based: VADER adds up word scores from a hand-made lexicon ("crisis" -, "win" +)
+    vader = SentimentIntensityAnalyzer()
+    df["vader"] = df["text_fixed"].apply(lambda t: vader.polarity_scores(t)["compound"])
+    df["vader_label"] = df["vader"].apply(vader_label)
+
+    # 2. Pre-trained transformer: DistilBERT fine-tuned on movie-review sentences (SST-2), positive/negative only
+    classifier = pipeline("sentiment-analysis", model=SENTIMENT_MODEL)
+    preds = classifier(df["text_fixed"].tolist(), batch_size=32, truncation=True)
+    df["bert_label"] = [p["label"].lower() for p in preds]
+    df["bert"] = [p["score"] if p["label"] == "POSITIVE" else -p["score"] for p in preds]
+
+    # 3. Does sentiment differ by news type? Label shares per category for both models
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharey=True)
+    colors = {"negative": "#d62728", "neutral": "#9e9e9e", "positive": "#2ca02c"}
+    for ax, col, title in [(axes[0], "vader_label", "VADER (rule-based)"),
+                           (axes[1], "bert_label", "DistilBERT (transformer)")]:
+        shares = (pd.crosstab(df["category"], df[col], normalize="index") * 100).reindex(CATEGORIES)
+        shares = shares[[c for c in colors if c in shares.columns]]
+        shares.plot.barh(stacked=True, ax=ax, color=[colors[c] for c in shares.columns], legend=False)
+        ax.set_title(title)
+        ax.set_xlabel("% of articles")
+        ax.set_ylabel("")
+        ax.invert_yaxis()
+    fig.legend(handles=[Patch(color=c, label=label) for label, c in colors.items()],
+               loc="center left", bbox_to_anchor=(1.0, 0.5))
+    fig.suptitle(f"Sentiment of {len(df):,} news articles by category")
+    fig.tight_layout()
+    save_fig(fig, "sentiment_by_category.png")
+
+    # 4. How often do they agree? (only where VADER picked a side - the transformer has no "neutral")
+    decided = df["vader_label"] != "neutral"
+    agree = (df.loc[decided, "vader_label"] == df.loc[decided, "bert_label"]).mean()
+    summary = pd.DataFrame({
+        "metric": ["articles scored", "articles VADER calls neutral", "articles the transformer calls negative",
+                   "agreement where VADER isn't neutral"],
+        "value": [f"{len(df):,}", f"{(~decided).mean():.0%}", f"{(df['bert_label'] == 'negative').mean():.0%}",
+                  f"{agree:.0%}"]})
+    save_table(summary, "sentiment.md", "Rule-based vs transformer sentiment")
+    by_cat = df.groupby("category").agg(vader_mean=("vader", "mean"),
+                                        vader_neg=("vader_label", lambda s: (s == "negative").mean()),
+                                        bert_neg=("bert_label", lambda s: (s == "negative").mean())).reindex(CATEGORIES)
+    save_table(pd.DataFrame({"category": CATEGORIES,
+                             "VADER mean score (-1 to +1)": [f"{v:+.2f}" for v in by_cat["vader_mean"]],
+                             "negative (VADER)": [f"{v:.0%}" for v in by_cat["vader_neg"]],
+                             "negative (transformer)": [f"{v:.0%}" for v in by_cat["bert_neg"]]}),
+               "sentiment.md", "Sentiment by category", append=True)
+    print(f"  VADER neutral on {(~decided).mean():.0%} of articles; models agree on {agree:.0%} of the rest")
+
+    # 5. The biggest disagreements: confident opposite answers
+    clash = df[decided & (df["vader_label"] != df["bert_label"])].copy()
+    clash["strength"] = clash["vader"].abs() * clash["bert"].abs()
+    rows = []
+    for vader_side in ["positive", "negative"]:
+        for _, r in clash[clash["vader_label"] == vader_side].nlargest(3, "strength").iterrows():
+            rows.append({"category": r["category"], "article": r["text_fixed"][:140],
+                         "VADER": f"{r['vader']:+.2f}", "transformer": f"{r['bert_label']} ({abs(r['bert']):.2f})"})
+    save_table(pd.DataFrame(rows), "sentiment.md", "Biggest disagreements", append=True)
+
+
 # --------------------------------------------------------------------------- pipeline
 
 def main():
     parser = argparse.ArgumentParser(description="One-file NLP pipeline on AG News")
-    parser.add_argument("--stage", choices=["all", "preprocess", "pos_ner"], default="all",
+    parser.add_argument("--stage", choices=["all", "preprocess", "pos_ner", "sentiment"], default="all",
                         help="run a single stage instead of all of them")
     args = parser.parse_args()
 
@@ -326,6 +411,9 @@ def main():
     if args.stage in ("all", "pos_ner"):
         print("\n[pos_ner]")
         stage_pos_ner(df)
+    if args.stage in ("all", "sentiment"):
+        print("\n[sentiment]")
+        stage_sentiment(df)
 
 
 if __name__ == "__main__":
