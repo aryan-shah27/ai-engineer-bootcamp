@@ -31,6 +31,7 @@ matplotlib.use("Agg")  # save charts as PNG files instead of opening windows
 import matplotlib.pyplot as plt
 import nltk
 import pandas as pd
+import spacy
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 from nltk.tokenize import word_tokenize
@@ -235,11 +236,83 @@ def stage_preprocess(df, **_):
     save_table(pd.DataFrame(money_rows), "money_mentions.md", "Dollar amounts found by regex")
 
 
+# --------------------------------------------------------------------------- stage 2: POS tagging and NER
+
+POS_TAGS = ["PROPN", "NOUN", "VERB", "ADJ", "NUM"]
+ENTITY_LABELS = ["PERSON", "ORG", "GPE", "NORP", "DATE", "MONEY", "CARDINAL"]
+
+
+def stage_pos_ner(df):
+    """Course: Identifying Parts of Speech and Named Entities - POS tagging and NER with spaCy.
+
+    Runs on text_fixed, not the stage 1 tokens: spaCy needs capital letters and full sentences
+    to tell "Apple" the company from "apple" the fruit.
+    """
+    nlp = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer"])  # only the tagger and NER are needed
+    docs = list(nlp.pipe(df["text_fixed"], batch_size=200))
+
+    # 1. POS tagging: what share of each category's words are names, nouns, verbs, adjectives, numbers?
+    pos_counts = pd.DataFrame([Counter(t.pos_ for t in doc if not (t.is_punct or t.is_space)) for doc in docs])
+    pos_share = pos_counts.fillna(0).groupby(df["category"]).sum()
+    pos_share = pos_share.div(pos_share.sum(axis=1), axis=0).reindex(CATEGORIES)[POS_TAGS] * 100
+    ax = pos_share.plot.bar(figsize=(10, 5), rot=0)
+    ax.set_ylabel("% of words")
+    ax.set_xlabel("")
+    ax.set_title("Part-of-speech mix per category")
+    ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left")
+    save_fig(ax.figure, "pos_by_category.png")
+    print("  POS (% of words): " + ", ".join(f"{cat} {pos_share.loc[cat, 'PROPN']:.0f}% PROPN / "
+                                              f"{pos_share.loc[cat, 'NUM']:.0f}% NUM" for cat in CATEGORIES))
+
+    # 2. NER: which kinds of entities does each category talk about?
+    ents = pd.DataFrame([(cat, ent.text, ent.label_) for cat, doc in zip(df["category"], docs) for ent in doc.ents],
+                        columns=["category", "text", "label"])
+    per_article = (ents[ents["label"].isin(ENTITY_LABELS)].groupby(["category", "label"]).size()
+                   .unstack(fill_value=0).reindex(index=CATEGORIES, columns=ENTITY_LABELS, fill_value=0)
+                   .div(df["category"].value_counts(), axis=0))
+    ax = per_article.plot.bar(figsize=(11, 5), rot=0)
+    ax.set_ylabel("entities per article")
+    ax.set_xlabel("")
+    ax.set_title("Named entities per article, by type")
+    ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left")
+    save_fig(ax.figure, "entities_by_category.png")
+
+    rows = []
+    for cat in CATEGORIES:
+        row = {"category": cat}
+        for label in ["PERSON", "ORG", "GPE"]:
+            top = ents.loc[(ents["category"] == cat) & (ents["label"] == label), "text"].value_counts().head(5)
+            row[label] = ", ".join(f"{name} ({n})" for name, n in top.items())
+        rows.append(row)
+    save_table(pd.DataFrame(rows), "top_entities.md", "Top 5 people (PERSON), organisations (ORG) and places (GPE)")
+
+    # 3. Multi-word names: what stage 1's word-by-word tokens broke apart ("united state")
+    names = ents[ents["label"].isin(["PERSON", "ORG", "GPE"])]
+    multi_word = names["text"].str.contains(" ")
+    save_table(pd.DataFrame({
+        "metric": ["entities found", "entities per article", "people/organisations/places spanning 2+ words",
+                   "most common multi-word names"],
+        "value": [f"{len(ents):,}", f"{len(ents) / len(df):.1f}", f"{multi_word.mean():.0%}",
+                  ", ".join(names.loc[multi_word, "text"].value_counts().head(6).index)]}),
+        "top_entities.md", "NER summary", append=True)
+    print(f"  NER: {len(ents):,} entities ({len(ents) / len(df):.1f} per article), "
+          f"{multi_word.mean():.0%} of people/organisations/places span 2+ words")
+
+    # 4. Where NER gets confused: the same name given different labels in different articles
+    #    (plain numbers are skipped: "50" really can be money in one article and a count in another)
+    labels_per_name = ents[ents["text"].str.contains("[A-Za-z]")].groupby("text")["label"].agg(Counter)
+    mixed = [(name, c) for name, c in labels_per_name.items() if sum(c.values()) >= 5 and len(c) > 1]
+    mixed.sort(key=lambda item: sum(item[1].values()) - item[1].most_common(1)[0][1], reverse=True)
+    save_table(pd.DataFrame([{"name": name, "labels spaCy gave it": ", ".join(f"{lab} x{n}" for lab, n in c.most_common())}
+                             for name, c in mixed[:10]]),
+               "top_entities.md", "Same name, different labels (where NER gets confused)", append=True)
+
+
 # --------------------------------------------------------------------------- pipeline
 
 def main():
     parser = argparse.ArgumentParser(description="One-file NLP pipeline on AG News")
-    parser.add_argument("--stage", choices=["all", "preprocess"], default="all",
+    parser.add_argument("--stage", choices=["all", "preprocess", "pos_ner"], default="all",
                         help="run a single stage instead of all of them")
     args = parser.parse_args()
 
@@ -250,6 +323,9 @@ def main():
     if args.stage in ("all", "preprocess"):
         print("\n[preprocess]")
         stage_preprocess(df)
+    if args.stage in ("all", "pos_ner"):
+        print("\n[pos_ner]")
+        stage_pos_ner(df)
 
 
 if __name__ == "__main__":
