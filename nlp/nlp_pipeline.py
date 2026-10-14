@@ -31,6 +31,7 @@ matplotlib.use("Agg")  # save charts as PNG files instead of opening windows
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import nltk
+import numpy as np
 import pandas as pd
 import spacy
 from nltk.corpus import stopwords
@@ -38,6 +39,8 @@ from nltk.sentiment import SentimentIntensityAnalyzer
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 from nltk.tokenize import word_tokenize
 from nltk.util import ngrams
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 N = 4000  # articles sampled for the analysis stages (1,000 per category)
 SENTIMENT_N = 1000  # the transformer manages ~20 articles/second on a CPU, so sentiment uses a smaller sample
@@ -393,11 +396,103 @@ def stage_sentiment(df):
     save_table(pd.DataFrame(rows), "sentiment.md", "Biggest disagreements", append=True)
 
 
+# --------------------------------------------------------------------------- stage 4: vectorizing
+
+def similarity_by_category(sim, categories):
+    """Average cosine similarity between the articles of every pair of categories."""
+    return pd.DataFrame([[np.nanmean(sim[np.ix_(categories == a, categories == b)]) for b in CATEGORIES]
+                         for a in CATEGORIES], index=CATEGORIES, columns=CATEGORIES)
+
+
+def most_similar(sim, i, k=3):
+    """Indexes of the k articles closest to article i (sim has NaN on its diagonal, so i never matches itself)."""
+    return np.argsort(-np.nan_to_num(sim[i], nan=-1), kind="stable")[:k]
+
+
+def stage_vectorize(df):
+    """Course: Vectorizing Text - bag of words (CountVectorizer) vs TF-IDF (TfidfVectorizer), cosine similarity.
+
+    Runs on clean_text from stage 1 (lowercased lemmas, no stop words). min_df=2 drops words that appear
+    in only one article: typos and one-off names can't link two articles together anyway.
+    """
+    categories = df["category"].to_numpy()
+    vectorizers = {"bag of words": CountVectorizer(min_df=2),
+                   "TF-IDF": TfidfVectorizer(min_df=2),
+                   "TF-IDF + bigrams": TfidfVectorizer(min_df=2, ngram_range=(1, 2))}
+
+    # 1. Text -> vectors. Compare size, sparsity, and whether similar vectors mean similar topics
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    heat_axes = iter(axes)
+    matrices, stats = {}, []
+    for name, vectorizer in vectorizers.items():
+        X = matrices[name] = vectorizer.fit_transform(df["clean_text"])
+        sim = cosine_similarity(X)
+        np.fill_diagonal(sim, np.nan)  # every article is identical to itself - ignore that
+        nearest = np.nanargmax(sim, axis=1)
+        by_cat = similarity_by_category(sim, categories)
+        within = np.diag(by_cat).mean()
+        across = by_cat.to_numpy()[~np.eye(len(CATEGORIES), dtype=bool)].mean()
+        stats.append({"representation": name,
+                      "vocabulary": f"{X.shape[1]:,}",
+                      "non-zero cells": f"{X.nnz / (X.shape[0] * X.shape[1]):.2%}",
+                      "own-category vs other-category similarity": f"{within / across:.2f}x",
+                      "nearest neighbour in the same category": f"{(categories[nearest] == categories).mean():.1%}"})
+        if name == "TF-IDF":
+            tfidf_sim = sim
+        if name in ("bag of words", "TF-IDF"):
+            ax, values = next(heat_axes), by_cat.to_numpy()
+            ax.imshow(values, cmap="Blues")
+            ax.set_xticks(range(len(CATEGORIES)), CATEGORIES)
+            ax.set_yticks(range(len(CATEGORIES)), CATEGORIES)
+            for r in range(len(CATEGORIES)):
+                for c in range(len(CATEGORIES)):
+                    ax.text(c, r, f"{values[r, c]:.3f}", ha="center", va="center",
+                            color="white" if values[r, c] > 0.6 * values.max() else "black")
+            ax.set_title(f"{name}: own category {within / across:.1f}x more similar")
+    fig.suptitle("Average cosine similarity between articles of each category")
+    fig.tight_layout()
+    save_fig(fig, "category_similarity.png")
+    save_table(pd.DataFrame(stats), "bow_vs_tfidf.md", "Bag of words vs TF-IDF")
+    print("  nearest neighbour in the same category: " +
+          ", ".join(f"{s['representation']} {s['nearest neighbour in the same category']}" for s in stats))
+
+    # 2. What TF-IDF changes: top words per category by raw count vs by TF-IDF weight
+    vocab = vectorizers["bag of words"].get_feature_names_out()  # same tokens and min_df, so same vocabulary as TF-IDF
+    rows = []
+    for cat in CATEGORIES:
+        in_cat = categories == cat
+        counts = np.asarray(matrices["bag of words"][in_cat].sum(axis=0)).ravel()
+        weights = np.asarray(matrices["TF-IDF"][in_cat].mean(axis=0)).ravel()
+        rows.append({"category": cat,
+                     "top 8 by raw count": ", ".join(vocab[np.argsort(-counts, kind="stable")[:8]]),
+                     "top 8 by TF-IDF": ", ".join(vocab[np.argsort(-weights, kind="stable")[:8]])})
+    save_table(pd.DataFrame(rows), "bow_vs_tfidf.md", "Top words per category", append=True)
+
+    # 3. Why: IDF shrinks words that appear everywhere
+    doc_share = matrices["bag of words"].getnnz(axis=0) / len(df)
+    idf = vectorizers["TF-IDF"].idf_
+    idf_rows = [{"word": vocab[i], "in % of articles": f"{doc_share[i]:.1%}", "IDF weight": f"{idf[i]:.2f}"}
+                for i in np.argsort(-doc_share, kind="stable")[:8]]
+    idf_rows.append({"word": "(any word in only 2 articles)", "in % of articles": f"{2 / len(df):.2%}",
+                     "IDF weight": f"{idf.max():.2f}"})
+    save_table(pd.DataFrame(idf_rows), "bow_vs_tfidf.md", "The most common words get the lowest IDF", append=True)
+
+    # 4. "Find similar articles" with TF-IDF + cosine similarity
+    rows = []
+    for cat in CATEGORIES:
+        i = np.flatnonzero(categories == cat)[0]
+        rows.append({"article": f"**{df.at[i, 'text_fixed'][:110]}**", "category": cat, "cosine similarity": "query"})
+        for j in most_similar(tfidf_sim, i):
+            rows.append({"article": "↳ " + df.at[j, "text_fixed"][:110], "category": categories[j],
+                         "cosine similarity": f"{tfidf_sim[i, j]:.2f}"})
+    save_table(pd.DataFrame(rows), "similar_articles.md", "Most similar articles (TF-IDF + cosine similarity)")
+
+
 # --------------------------------------------------------------------------- pipeline
 
 def main():
     parser = argparse.ArgumentParser(description="One-file NLP pipeline on AG News")
-    parser.add_argument("--stage", choices=["all", "preprocess", "pos_ner", "sentiment"], default="all",
+    parser.add_argument("--stage", choices=["all", "preprocess", "pos_ner", "sentiment", "vectorize"], default="all",
                         help="run a single stage instead of all of them")
     args = parser.parse_args()
 
@@ -414,6 +509,9 @@ def main():
     if args.stage in ("all", "sentiment"):
         print("\n[sentiment]")
         stage_sentiment(df)
+    if args.stage in ("all", "vectorize"):
+        print("\n[vectorize]")
+        stage_vectorize(df)
 
 
 if __name__ == "__main__":

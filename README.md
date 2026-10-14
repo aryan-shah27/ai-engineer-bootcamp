@@ -5,7 +5,7 @@ The code is my own. The course notebooks and datasets are not included.
 
 | Project | What it shows | Status |
 |---|---|---|
-| [NLP pipeline](#nlp-pipeline-ag-news) | Every technique from the course's NLP module, in one script, on 120k real news articles | 🚧 stage 3 of 7 |
+| [NLP pipeline](#nlp-pipeline-ag-news) | Every technique from the course's NLP module, in one script, on 120k real news articles | 🚧 stage 4 of 7 |
 
 ---
 
@@ -20,7 +20,7 @@ The analysis stages use a stratified sample of 4,000 articles (1,000 per categor
 | 1. Preprocessing | regex cleanup, lowercasing, tokenization, stop words, stemming vs lemmatization, n-grams | ✅ |
 | 2. POS & NER | part-of-speech tagging, named entity recognition (spaCy) | ✅ |
 | 3. Sentiment | rule-based (VADER) vs pre-trained transformer (DistilBERT) | ✅ |
-| 4. Vectorizing | bag of words vs TF-IDF, cosine similarity | ⏳ |
+| 4. Vectorizing | bag of words vs TF-IDF, cosine similarity | ✅ |
 | 5. Topic modelling | LDA, LSA, choosing the number of topics | ⏳ |
 | 6. Text classifier | logistic regression vs naive Bayes vs linear SVM | ⏳ |
 | 7. Case study | what the stages say together | ⏳ |
@@ -36,7 +36,9 @@ python nlp/nlp_pipeline.py --stage preprocess  # one stage
 ```
 
 `requirements.txt` also installs spaCy's small English model (`en_core_web_sm`). The first run downloads AG News, the
-DistilBERT sentiment model (~270 MB) and the NLTK word lists; all are cached afterwards. A full run takes about 1.5 minutes on a laptop CPU.
+DistilBERT sentiment model (~270 MB) and the NLTK word lists; all are cached afterwards. A full run takes about 75 seconds on a laptop CPU (Intel i7-1360P, plugged in, 2 timed runs):
+loading + cleaning 10 s, POS/NER 13 s, sentiment 46 s, vectorizing 6 s. Peak memory use is about 1.2 GB.
+On battery it can take up to twice as long.
 Charts and tables are saved to [`nlp/results/`](nlp/results/).
 
 ### Stage 1: Preprocessing
@@ -97,6 +99,26 @@ Two approaches score the same 1,000 articles (250 per category):
   ("supporting", "greatest"), and "Syracuse Dismantles Memphis", a win, scores −0.85 ("dismantles"). DistilBERT handles
   those but calls "Jakarta Hunts Islamic Militants After Embassy Attack" positive with 100% confidence.
   A confident score isn't a correct one.
+
+### Stage 4: Vectorizing (bag of words vs TF-IDF)
+
+Models need numbers, not words. Both methods turn each article's stage 1 lemmas into a vector with one column per word.
+Bag of words counts each word. TF-IDF multiplies the count by how rare the word is across all articles.
+
+![Average similarity between categories](nlp/results/category_similarity.png)
+
+- **Text becomes a huge, almost empty matrix:** 4,000 articles × 6,976 words, and 99.73% of the cells are zero. That's
+  why scikit-learn stores it as a sparse matrix, keeping only the non-zero cells. [Tables](nlp/results/bow_vs_tfidf.md)
+- **TF-IDF turns down words that are everywhere.** "new" appears in 11.5% of articles and gets an IDF weight of 3.17;
+  a word in just 2 articles gets 8.20. So generic words drop out of each category's top list: "two" → "iraqi" (World),
+  "new" → "league" (Sports), "year, new" → "profit, dollar" (Business).
+- **Similar vectors mean similar topics:** articles are 2.2× (bag of words) to 2.4× (TF-IDF) more similar to their own
+  category than to others. Business and Sci/Tech overlap the most, since companies like Microsoft and IBM appear in both.
+- **On short texts the gain is small.** An article's nearest neighbour shares its category 79.2% of the time with bag of
+  words, 79.3% with TF-IDF and 80.2% with word pairs added. The articles average about 23 words, so most words appear once
+  per article and TF-IDF mostly just reweights by rarity.
+- **"Find similar articles" works out of the box:** a Baghdad car-bomb story's 3 nearest neighbours are all other Baghdad
+  car-bomb stories (cosine similarity 0.53, 0.44, 0.40). [Examples](nlp/results/similar_articles.md)
 
 ---
 
